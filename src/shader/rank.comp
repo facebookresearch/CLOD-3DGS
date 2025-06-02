@@ -1,0 +1,83 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// All rights reserved.
+//
+// This source code is licensed under the license found in the
+// LICENSE file in the root directory of this source tree.
+
+#version 460
+
+layout (local_size_x = 256) in;
+
+layout (set = 0, binding = 0) uniform Camera {
+  mat4 projection;
+  mat4 view;
+  mat4 eye;
+  vec3 camera_position;
+  float pad0;
+  uvec2 screen_size;  // (width, height)
+  float z_near;
+  float z_far;
+  float frustum_pad_x;
+  float frustum_pad_y;
+};
+
+layout (push_constant, std430) uniform PushConstants {
+  mat4 model;
+  vec4 lod_params;
+};
+
+layout (set = 1, binding = 0) uniform Info {
+  uint point_count;
+};
+
+layout (std430, set = 1, binding = 1) readonly buffer GaussianPosition {
+  float gaussian_position[];  // (N, 3)
+};
+
+layout (std430, set = 2, binding = 2) buffer VisiblePointCount {
+  uint visible_point_count;
+};
+
+layout (std430, set = 2, binding = 3) writeonly buffer InstanceKey {
+  uint key[];
+};
+
+layout (std430, set = 2, binding = 4) writeonly buffer InstanceIndex {
+  uint index[];
+};
+
+void main() {
+  uint id = gl_GlobalInvocationID.x;
+  if (id >= point_count) return;
+
+  vec4 o_pos = vec4(gaussian_position[id * 3 + 0], gaussian_position[id * 3 + 1], gaussian_position[id * 3 + 2], 1.f);
+
+  vec4 pos = projection * view * model * o_pos;
+  pos = pos / pos.w;
+
+  
+  // sort based on distance to camera versus projection depth
+  // float depth = pos.z; // (original version) projection only
+  vec4 pos_r = view * model * o_pos;
+  float depth = distance(pos_r.xyz, vec3(0)) / z_far;
+
+  // distance-based CLOD (culling phase)
+  bool visible_dist = true;
+  float dist = distance(pos_r.xyz, vec3(0));
+  if (lod_params.x < 1.0) {
+    float alpha = clamp((dist - lod_params[2]) / (lod_params[3] - lod_params[2]), 0.0, 1.0);
+    float splat_threshold = mix(lod_params[1], lod_params[0], alpha);
+    if (id > splat_threshold * point_count) {
+        visible_dist = false;
+    }
+  }
+
+  bool visible_frustum = (abs(pos.x) < frustum_pad_x && abs(pos.y) < frustum_pad_y && pos.z >= 0.0f && depth <= 1.f);
+  
+  // valid only when center is inside NDC clip space.
+  if (visible_frustum && visible_dist) {
+    uint instance_index = atomicAdd(visible_point_count, 1);
+    key[instance_index] = floatBitsToUint(1.f - depth);
+    index[instance_index] = id;
+  }
+}
